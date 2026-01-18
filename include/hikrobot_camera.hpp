@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <cstdint>
+#include <cmath>
+#include <string>
 #include <opencv2/opencv.hpp>
 #include "MvErrorDefine.h"
 #include "CameraParams.h"
@@ -17,8 +19,19 @@ namespace camera
     cv::Mat frame;
     //********** frame_empty ******************************/
     bool frame_empty = 0;
+    //********** frame_stamp ******************************/
+    ros::Time frame_stamp;
+    bool frame_stamp_valid = false;
     //********** mutex ************************************/
     pthread_mutex_t mutex;
+    //********** timestamp config ******************************/
+    bool use_device_timestamp = true;
+    std::string device_ts_offset_calib = "first";
+    long double dev_ts_tick_hz = 0.0L;
+    long double dev_ts_offset_epoch_sec = 0.0L;
+    bool dev_ts_inited = false;
+    uint64_t last_dev_ticks = 0;
+    bool last_dev_ticks_valid = false;
     //********** CameraProperties config ************************************/
     enum CamerProperties
     {
@@ -58,9 +71,47 @@ namespace camera
         return nRet;
     }
 
+    static bool TryGetInt(void *handle, const char *key, uint64_t &out)
+    {
+        MVCC_INTVALUE v = {0};
+        int nRet = MV_CC_GetIntValue(handle, key, &v);
+        if (nRet != MV_OK)
+        {
+            ROS_WARN("MV_CC_GetIntValue(%s) failed, nRet=0x%x", key, nRet);
+            return false;
+        }
+        out = static_cast<uint64_t>(v.nCurValue);
+        ROS_INFO("Get %s = %lu", key, static_cast<unsigned long>(out));
+        return true;
+    }
+
     [[maybe_unused]] static int TrySetBoolByInt(void *handle, const char *key, bool on)
     {
         return TrySetInt(handle, key, on ? 1 : 0);
+    }
+
+    static inline uint64_t DevTsTicks(uint32_t hi, uint32_t lo)
+    {
+        return (static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo);
+    }
+
+    static ros::Time DevTsToRosTime(uint64_t ticks)
+    {
+        long double t = dev_ts_offset_epoch_sec + static_cast<long double>(ticks) / dev_ts_tick_hz;
+        if (t < 0)
+        {
+            t = 0;
+        }
+        const uint32_t sec = static_cast<uint32_t>(std::floor(t));
+        long double frac = (t - static_cast<long double>(sec)) * 1e9L;
+        uint32_t nsec = static_cast<uint32_t>(std::llround(frac));
+        uint32_t sec2 = sec;
+        if (nsec >= 1000000000U)
+        {
+            sec2 += 1;
+            nsec -= 1000000000U;
+        }
+        return ros::Time(sec2, nsec);
     }
 
     static void SetGigeTransportParamsIfNeeded(void *cam_handle,
@@ -134,7 +185,7 @@ namespace camera
         //********** 恢复默认参数 *************************/
         bool reset();
         //********** 读图10个相机的原始图像 ********************************/
-        void ReadImg(cv::Mat &image);
+        void ReadImg(cv::Mat &image, ros::Time &stamp);
 
     private:
         //********** handle ******************************/
@@ -184,6 +235,8 @@ namespace camera
         node.param("TriggerMode", TriggerMode, 1);
         node.param("TriggerSource", TriggerSource, 2);
         node.param("LineSelector", LineSelector, 2);
+        node.param("use_device_timestamp", use_device_timestamp, true);
+        node.param("device_ts_offset_calib", device_ts_offset_calib, std::string("first"));
         int gev_scps_packet_size = 0;
         int gev_scpd = 0;
         int gev_heartbeat_timeout_ms = 30000;
@@ -239,6 +292,29 @@ namespace camera
         {
             printf("MV_CC_OpenDevice fail! nRet [%x]\n", nRet);
             exit(-1);
+        }
+
+        dev_ts_tick_hz = 0.0L;
+        dev_ts_inited = false;
+        last_dev_ticks_valid = false;
+        frame_stamp_valid = false;
+        if (use_device_timestamp)
+        {
+            if (device_ts_offset_calib != "first")
+            {
+                ROS_WARN("device_ts_offset_calib=%s not supported, using 'first'.",
+                         device_ts_offset_calib.c_str());
+            }
+            uint64_t tick_hz_value = 0;
+            if (TryGetInt(handle, "GevTimestampTickFrequency", tick_hz_value) ||
+                TryGetInt(handle, "Std::GevTimestampTickFrequency", tick_hz_value))
+            {
+                dev_ts_tick_hz = static_cast<long double>(tick_hz_value);
+            }
+            else
+            {
+                ROS_WARN("Failed to read GevTimestampTickFrequency, falling back to ros::Time::now().");
+            }
         }
 
         SetGigeTransportParamsIfNeeded(handle,
@@ -726,18 +802,20 @@ namespace camera
     }
 
     //^ ********************************** Camera constructor************************************ //
-    void Camera::ReadImg(cv::Mat &image)
+    void Camera::ReadImg(cv::Mat &image, ros::Time &stamp)
     {
 
         pthread_mutex_lock(&mutex);
         if (frame_empty)
         {
             image = cv::Mat();
+            stamp = ros::Time(0);
         }
         else
         {
             image = camera::frame.clone();
             frame_empty = 1;
+            stamp = frame_stamp_valid ? frame_stamp : ros::Time(0);
         }
         pthread_mutex_unlock(&mutex);
     }
@@ -780,6 +858,26 @@ namespace camera
             MV_CC_ConvertPixelType(p_handle, &stConvertParam);
             pthread_mutex_lock(&mutex);
             camera::frame = cv::Mat(stImageInfo.nHeight, stImageInfo.nWidth, CV_8UC3, m_pBufForSaveImage).clone(); //tmp.clone();
+            if (use_device_timestamp && dev_ts_tick_hz > 0.0L)
+            {
+                uint64_t ticks = DevTsTicks(stImageInfo.nDevTimeStampHigh, stImageInfo.nDevTimeStampLow);
+                if (!dev_ts_inited || !last_dev_ticks_valid || ticks <= last_dev_ticks)
+                {
+                    ros::Time now = ros::Time::now();
+                    dev_ts_offset_epoch_sec = static_cast<long double>(now.toSec()) -
+                                              static_cast<long double>(ticks) / dev_ts_tick_hz;
+                    dev_ts_inited = true;
+                }
+                frame_stamp = DevTsToRosTime(ticks);
+                frame_stamp_valid = true;
+                last_dev_ticks = ticks;
+                last_dev_ticks_valid = true;
+            }
+            else
+            {
+                frame_stamp = ros::Time::now();
+                frame_stamp_valid = true;
+            }
             frame_empty = 0;
             pthread_mutex_unlock(&mutex);
             double time = ((double)cv::getTickCount() - start) / cv::getTickFrequency();
