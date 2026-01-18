@@ -938,7 +938,12 @@ namespace camera
             }
             stConvertParam.nDstBufferSize = static_cast<unsigned int>(dst_size); //ch:输出缓存大小 | en:output buffer size
             stConvertParam.enSrcPixelType = stImageInfo.enPixelType;    //ch:输入像素格式 | en:input pixel format                       //! 输入格式 RGB
-            MV_CC_ConvertPixelType(p_handle, &stConvertParam);
+            int cvtRet = MV_CC_ConvertPixelType(p_handle, &stConvertParam);
+            if (cvtRet != MV_OK)
+            {
+                ROS_WARN("MV_CC_ConvertPixelType failed, nRet=0x%x", cvtRet);
+                continue;
+            }
             pthread_mutex_lock(&mutex);
             camera::frame = cv::Mat(stImageInfo.nHeight, stImageInfo.nWidth, CV_8UC3, m_pBufForSaveImage).clone(); //tmp.clone();
             if (use_device_timestamp && dev_ts_tick_hz > 0.0L)

@@ -38,8 +38,14 @@ int main(int argc, char **argv)
     cv_bridge::CvImagePtr cv_ptr = boost::make_shared<cv_bridge::CvImage>();
     cv_ptr->encoding = sensor_msgs::image_encodings::BGR8;  // 就是rgb格式 
     
-    //********** 10 Hz        **********/
-    ros::Rate loop_rate(10);
+    //********** publish rate **********/
+    int pub_rate = 10;
+    hikrobot_camera.param("FrameRate", pub_rate, 10);
+    if (pub_rate <= 0)
+    {
+        pub_rate = 10;
+    }
+    ros::Rate loop_rate(pub_rate);
 
     while (ros::ok())
     {
