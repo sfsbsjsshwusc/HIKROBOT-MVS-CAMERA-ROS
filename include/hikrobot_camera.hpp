@@ -235,6 +235,7 @@ namespace camera
         //********** 恢复默认参数 *************************/
         bool reset();
         //********** 读图10个相机的原始图像 ********************************/
+        void ReadImg(cv::Mat &image);
         void ReadImg(cv::Mat &image, ros::Time &stamp);
 
     private:
@@ -346,7 +347,15 @@ namespace camera
             exit(-1);
         }
 
-        SetPtp1588(handle, ptp_enable);
+        MV_CC_DEVICE_INFO *device_info = stDeviceList.pDeviceInfo[0];
+        if (device_info->nTLayerType == MV_GIGE_DEVICE)
+        {
+            SetPtp1588(handle, ptp_enable);
+        }
+        else
+        {
+            ROS_INFO("Non-GigE device, skip PTP enable.");
+        }
 
         dev_ts_tick_hz = 0.0L;
         dev_ts_inited = false;
@@ -360,8 +369,9 @@ namespace camera
                          device_ts_offset_calib.c_str());
             }
             uint64_t tick_hz_value = 0;
-            if (TryGetInt(handle, "GevTimestampTickFrequency", tick_hz_value) ||
-                TryGetInt(handle, "Std::GevTimestampTickFrequency", tick_hz_value))
+            if (device_info->nTLayerType == MV_GIGE_DEVICE &&
+                (TryGetInt(handle, "GevTimestampTickFrequency", tick_hz_value) ||
+                 TryGetInt(handle, "Std::GevTimestampTickFrequency", tick_hz_value)))
             {
                 dev_ts_tick_hz = static_cast<long double>(tick_hz_value);
             }
@@ -372,7 +382,7 @@ namespace camera
         }
 
         SetGigeTransportParamsIfNeeded(handle,
-                                       stDeviceList.pDeviceInfo[0],
+                                       device_info,
                                        gev_scps_packet_size,
                                        gev_scpd,
                                        gev_heartbeat_timeout_ms);
@@ -856,6 +866,12 @@ namespace camera
     }
 
     //^ ********************************** Camera constructor************************************ //
+    void Camera::ReadImg(cv::Mat &image)
+    {
+        ros::Time dummy;
+        ReadImg(image, dummy);
+    }
+
     void Camera::ReadImg(cv::Mat &image, ros::Time &stamp)
     {
 
@@ -901,13 +917,26 @@ namespace camera
             image_empty_count = 0; //空图帧数
             //转换图像格式为BGR8
 
-            stConvertParam.nWidth = 3072;                               //ch:图像宽 | en:image width
-            stConvertParam.nHeight = 2048;                              //ch:图像高 | en:image height
+            stConvertParam.nWidth = stImageInfo.nWidth;                 //ch:图像宽 | en:image width
+            stConvertParam.nHeight = stImageInfo.nHeight;               //ch:图像高 | en:image height
             stConvertParam.pSrcData = m_pBufForDriver;                  //ch:输入数据缓存 | en:input data buffer
-            stConvertParam.nSrcDataLen = MAX_IMAGE_DATA_SIZE;           //ch:输入数据大小 | en:input data size
+            if (stImageInfo.nFrameLen > 0)
+            {
+                stConvertParam.nSrcDataLen = stImageInfo.nFrameLen;     //ch:输入数据大小 | en:input data size
+            }
+            else
+            {
+                stConvertParam.nSrcDataLen = MAX_IMAGE_DATA_SIZE;       //ch:输入数据大小 | en:input data size
+            }
             stConvertParam.enDstPixelType = PixelType_Gvsp_BGR8_Packed; //ch:输出像素格式 | en:output pixel format                      //! 输出格式 RGB
             stConvertParam.pDstBuffer = m_pBufForSaveImage;             //ch:输出数据缓存 | en:output data buffer
-            stConvertParam.nDstBufferSize = MAX_IMAGE_DATA_SIZE;        //ch:输出缓存大小 | en:output buffer size
+            uint64_t dst_size = static_cast<uint64_t>(stImageInfo.nWidth) *
+                                static_cast<uint64_t>(stImageInfo.nHeight) * 3;
+            if (dst_size > MAX_IMAGE_DATA_SIZE)
+            {
+                dst_size = MAX_IMAGE_DATA_SIZE;
+            }
+            stConvertParam.nDstBufferSize = static_cast<unsigned int>(dst_size); //ch:输出缓存大小 | en:output buffer size
             stConvertParam.enSrcPixelType = stImageInfo.enPixelType;    //ch:输入像素格式 | en:input pixel format                       //! 输入格式 RGB
             MV_CC_ConvertPixelType(p_handle, &stConvertParam);
             pthread_mutex_lock(&mutex);
@@ -915,17 +944,29 @@ namespace camera
             if (use_device_timestamp && dev_ts_tick_hz > 0.0L)
             {
                 uint64_t ticks = DevTsTicks(stImageInfo.nDevTimeStampHigh, stImageInfo.nDevTimeStampLow);
-                if (!dev_ts_inited || !last_dev_ticks_valid || ticks <= last_dev_ticks)
+                if (ticks == 0 || (last_dev_ticks_valid && ticks == last_dev_ticks))
+                {
+                    frame_stamp = ros::Time::now();
+                    frame_stamp_valid = true;
+                }
+                else if (!dev_ts_inited || !last_dev_ticks_valid || ticks <= last_dev_ticks)
                 {
                     ros::Time now = ros::Time::now();
                     dev_ts_offset_epoch_sec = static_cast<long double>(now.toSec()) -
                                               static_cast<long double>(ticks) / dev_ts_tick_hz;
                     dev_ts_inited = true;
+                    last_dev_ticks = ticks;
+                    last_dev_ticks_valid = true;
+                    frame_stamp = DevTsToRosTime(ticks);
+                    frame_stamp_valid = true;
                 }
-                frame_stamp = DevTsToRosTime(ticks);
-                frame_stamp_valid = true;
-                last_dev_ticks = ticks;
-                last_dev_ticks_valid = true;
+                else
+                {
+                    frame_stamp = DevTsToRosTime(ticks);
+                    frame_stamp_valid = true;
+                    last_dev_ticks = ticks;
+                    last_dev_ticks_valid = true;
+                }
             }
             else
             {
