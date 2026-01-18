@@ -20,3 +20,7 @@ use rviz subscribe topic： /hikrobot_camera/rgb
 source ./devel/setup.bash 
 roslaunch hikrobot_camera hikrobot_camera_rviz.launch
 ```
+
+## GigE 2.0 / IEEE1588 (PTP) 同步建议
+建议使用支持 IEEE1588（PTP 同步）的 GigE 2.0 相机，配合 linuxptp 可以让多台设备与主机时钟同步。
+使用 GigE 2.0 的优势是无需修改驱动或增加外部触发硬件；相机只需一根网线即可完成供电、数据传输与时钟同步。

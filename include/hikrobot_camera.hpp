@@ -3,6 +3,7 @@
 #include "ros/ros.h"
 #include <stdio.h>
 #include <pthread.h>
+#include <cstdint>
 #include <opencv2/opencv.hpp>
 #include "MvErrorDefine.h"
 #include "CameraParams.h"
@@ -43,6 +44,79 @@ namespace camera
     //^ *********************************************************************************** //
     //^ ********************************** Camera Class************************************ //
     //^ *********************************************************************************** //
+    static int TrySetInt(void *handle, const char *key, int64_t value)
+    {
+        int nRet = MV_CC_SetIntValue(handle, key, value);
+        if (nRet != MV_OK)
+        {
+            ROS_WARN("MV_CC_SetIntValue(%s=%ld) failed, nRet=0x%x", key, (long)value, nRet);
+        }
+        else
+        {
+            ROS_INFO("Set %s = %ld", key, (long)value);
+        }
+        return nRet;
+    }
+
+    [[maybe_unused]] static int TrySetBoolByInt(void *handle, const char *key, bool on)
+    {
+        return TrySetInt(handle, key, on ? 1 : 0);
+    }
+
+    static void SetGigeTransportParamsIfNeeded(void *cam_handle,
+                                               const MV_CC_DEVICE_INFO *dev_info,
+                                               int gev_scps_packet_size,
+                                               int gev_scpd,
+                                               int gev_heartbeat_timeout_ms)
+    {
+        if (dev_info == NULL)
+        {
+            return;
+        }
+
+        if (dev_info->nTLayerType != MV_GIGE_DEVICE)
+        {
+            ROS_INFO("Non-GigE device, skip GigE transport params.");
+            return;
+        }
+
+        int packet_size_to_set = gev_scps_packet_size;
+        if (packet_size_to_set <= 0)
+        {
+            int nPacketSize = MV_CC_GetOptimalPacketSize(cam_handle);
+            if (nPacketSize > 0)
+            {
+                packet_size_to_set = nPacketSize;
+                ROS_INFO("Optimal packet size from SDK: %d", packet_size_to_set);
+            }
+            else
+            {
+                packet_size_to_set = 1500;
+                ROS_WARN("GetOptimalPacketSize failed (%d), fallback to %d", nPacketSize, packet_size_to_set);
+            }
+        }
+
+        if (packet_size_to_set > 0)
+        {
+            TrySetInt(cam_handle, "GevSCPSPacketSize", packet_size_to_set);
+            TrySetInt(cam_handle, "Std::GevSCPSPacketSize", packet_size_to_set);
+        }
+
+        if (gev_scpd >= 0)
+        {
+            TrySetInt(cam_handle, "GevSCPD", gev_scpd);
+            TrySetInt(cam_handle, "Std::GevSCPD", gev_scpd);
+        }
+
+        if (gev_heartbeat_timeout_ms > 0)
+        {
+            TrySetInt(cam_handle, "GevHeartbeatTimeout", gev_heartbeat_timeout_ms);
+            TrySetInt(cam_handle, "Std::GevHeartbeatTimeout", gev_heartbeat_timeout_ms);
+        }
+
+        // Optional: TrySetBoolByInt(cam_handle, "GevSCPSDoNotFragment", true);
+    }
+
     class Camera
     {
     public:
@@ -110,6 +184,12 @@ namespace camera
         node.param("TriggerMode", TriggerMode, 1);
         node.param("TriggerSource", TriggerSource, 2);
         node.param("LineSelector", LineSelector, 2);
+        int gev_scps_packet_size = 0;
+        int gev_scpd = 0;
+        int gev_heartbeat_timeout_ms = 30000;
+        node.param("gev_scps_packet_size", gev_scps_packet_size, gev_scps_packet_size);
+        node.param("gev_scpd", gev_scpd, gev_scpd);
+        node.param("gev_heartbeat_timeout_ms", gev_heartbeat_timeout_ms, gev_heartbeat_timeout_ms);
 
         //********** 枚举设备 ********************************/
         MV_CC_DEVICE_INFO_LIST stDeviceList;
@@ -160,6 +240,12 @@ namespace camera
             printf("MV_CC_OpenDevice fail! nRet [%x]\n", nRet);
             exit(-1);
         }
+
+        SetGigeTransportParamsIfNeeded(handle,
+                                       stDeviceList.pDeviceInfo[0],
+                                       gev_scps_packet_size,
+                                       gev_scpd,
+                                       gev_heartbeat_timeout_ms);
 
         //设置 yaml 文件里面的配置
         this->set(CAP_PROP_FRAMERATE_ENABLE, FrameRateEnable);

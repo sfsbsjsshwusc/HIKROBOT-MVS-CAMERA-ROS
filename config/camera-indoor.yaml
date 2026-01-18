@@ -16,3 +16,8 @@ GainAuto: 2             #亮度的固定增益
 
 SaturationEnable: false
 Saturation: 128          #饱和度
+
+# GigE Transport Layer 参数
+gev_scps_packet_size: 0           # 0=自动(推荐)，>0=固定值；巨帧可设 9000（需 MTU 支持）
+gev_scpd: 0                       # Inter-Packet Delay，丢包时可增大
+gev_heartbeat_timeout_ms: 30000   # 心跳超时，调试可增大避免断连
