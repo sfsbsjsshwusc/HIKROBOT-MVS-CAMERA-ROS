@@ -23,5 +23,6 @@ gev_scpd: 0                       # Inter-Packet Delay，丢包时可增大
 gev_heartbeat_timeout_ms: 30000   # 心跳超时，调试可增大避免断连
 
 # 时间同步参数
+ptp_enable: true                  # 自动开启相机 PTP(IEEE1588)
 use_device_timestamp: true        # 使用相机硬件时间戳打 stamp
 device_ts_offset_calib: "first"   # 偏移标定方式：first(当前仅支持)

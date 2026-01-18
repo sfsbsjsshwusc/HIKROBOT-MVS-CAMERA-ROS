@@ -85,6 +85,34 @@ namespace camera
         return true;
     }
 
+    static int TrySetBool(void *handle, const char *key, bool value)
+    {
+        int nRet = MV_CC_SetBoolValue(handle, key, value ? 1 : 0);
+        if (nRet != MV_OK)
+        {
+            ROS_WARN("MV_CC_SetBoolValue(%s=%d) failed, nRet=0x%x", key, value ? 1 : 0, nRet);
+        }
+        else
+        {
+            ROS_INFO("Set %s = %s", key, value ? "true" : "false");
+        }
+        return nRet;
+    }
+
+    static int TrySetEnum(void *handle, const char *key, uint32_t value)
+    {
+        int nRet = MV_CC_SetEnumValue(handle, key, value);
+        if (nRet != MV_OK)
+        {
+            ROS_WARN("MV_CC_SetEnumValue(%s=%u) failed, nRet=0x%x", key, value, nRet);
+        }
+        else
+        {
+            ROS_INFO("Set %s = %u", key, value);
+        }
+        return nRet;
+    }
+
     [[maybe_unused]] static int TrySetBoolByInt(void *handle, const char *key, bool on)
     {
         return TrySetInt(handle, key, on ? 1 : 0);
@@ -112,6 +140,28 @@ namespace camera
             nsec -= 1000000000U;
         }
         return ros::Time(sec2, nsec);
+    }
+
+    static void SetPtp1588(void *cam_handle, bool enable)
+    {
+        const char *keys[] = {
+            "GevIEEE1588",
+            "Std::GevIEEE1588",
+            "GevIEEE1588Enable",
+            "Std::GevIEEE1588Enable"};
+
+        for (const char *key : keys)
+        {
+            if (TrySetBool(cam_handle, key, enable) == MV_OK)
+            {
+                return;
+            }
+            if (TrySetEnum(cam_handle, key, enable ? 1u : 0u) == MV_OK)
+            {
+                return;
+            }
+        }
+        ROS_WARN("PTP enable failed for all known keys. Please confirm node name/type.");
     }
 
     static void SetGigeTransportParamsIfNeeded(void *cam_handle,
@@ -235,6 +285,8 @@ namespace camera
         node.param("TriggerMode", TriggerMode, 1);
         node.param("TriggerSource", TriggerSource, 2);
         node.param("LineSelector", LineSelector, 2);
+        bool ptp_enable = true;
+        node.param("ptp_enable", ptp_enable, ptp_enable);
         node.param("use_device_timestamp", use_device_timestamp, true);
         node.param("device_ts_offset_calib", device_ts_offset_calib, std::string("first"));
         int gev_scps_packet_size = 0;
@@ -293,6 +345,8 @@ namespace camera
             printf("MV_CC_OpenDevice fail! nRet [%x]\n", nRet);
             exit(-1);
         }
+
+        SetPtp1588(handle, ptp_enable);
 
         dev_ts_tick_hz = 0.0L;
         dev_ts_inited = false;
