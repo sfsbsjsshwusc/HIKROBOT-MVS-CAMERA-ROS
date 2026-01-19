@@ -3,6 +3,9 @@
 #include "ros/ros.h"
 #include <stdio.h>
 #include <pthread.h>
+#include <cstdint>
+#include <cmath>
+#include <string>
 #include <opencv2/opencv.hpp>
 #include "MvErrorDefine.h"
 #include "CameraParams.h"
@@ -10,14 +13,38 @@
 
 namespace camera
 {
+#define HK_LOG(fmt, ...)                                      \
+    do                                                        \
+    {                                                         \
+        fprintf(stderr, "[HK] " fmt "\n", ##__VA_ARGS__);      \
+        fflush(stderr);                                       \
+    } while (0)
+
+#define HK_CHK(ret, msg)                                      \
+    do                                                        \
+    {                                                         \
+        HK_LOG("%s ret=0x%x", msg, (unsigned)(ret));          \
+    } while (0)
+
 //********** define ************************************/
 #define MAX_IMAGE_DATA_SIZE (4 * 2048 * 3072)
     //********** frame ************************************/
     cv::Mat frame;
     //********** frame_empty ******************************/
     bool frame_empty = 0;
+    //********** frame_stamp ******************************/
+    ros::Time frame_stamp;
+    bool frame_stamp_valid = false;
     //********** mutex ************************************/
     pthread_mutex_t mutex;
+    //********** timestamp config ******************************/
+    bool use_device_timestamp = true;
+    std::string device_ts_offset_calib = "first";
+    long double dev_ts_tick_hz = 0.0L;
+    long double dev_ts_offset_epoch_sec = 0.0L;
+    bool dev_ts_inited = false;
+    uint64_t last_dev_ticks = 0;
+    bool last_dev_ticks_valid = false;
     //********** CameraProperties config ************************************/
     enum CamerProperties
     {
@@ -43,6 +70,171 @@ namespace camera
     //^ *********************************************************************************** //
     //^ ********************************** Camera Class************************************ //
     //^ *********************************************************************************** //
+    static int TrySetInt(void *handle, const char *key, int64_t value)
+    {
+        int nRet = MV_CC_SetIntValue(handle, key, value);
+        if (nRet != MV_OK)
+        {
+            ROS_WARN("MV_CC_SetIntValue(%s=%ld) failed, nRet=0x%x", key, (long)value, nRet);
+        }
+        else
+        {
+            ROS_INFO("Set %s = %ld", key, (long)value);
+        }
+        return nRet;
+    }
+
+    static bool TryGetInt(void *handle, const char *key, uint64_t &out)
+    {
+        MVCC_INTVALUE v = {0};
+        int nRet = MV_CC_GetIntValue(handle, key, &v);
+        if (nRet != MV_OK)
+        {
+            ROS_WARN("MV_CC_GetIntValue(%s) failed, nRet=0x%x", key, nRet);
+            return false;
+        }
+        out = static_cast<uint64_t>(v.nCurValue);
+        ROS_INFO("Get %s = %lu", key, static_cast<unsigned long>(out));
+        return true;
+    }
+
+    static int TrySetBool(void *handle, const char *key, bool value)
+    {
+        int nRet = MV_CC_SetBoolValue(handle, key, value ? 1 : 0);
+        if (nRet != MV_OK)
+        {
+            ROS_WARN("MV_CC_SetBoolValue(%s=%d) failed, nRet=0x%x", key, value ? 1 : 0, nRet);
+        }
+        else
+        {
+            ROS_INFO("Set %s = %s", key, value ? "true" : "false");
+        }
+        return nRet;
+    }
+
+    static int TrySetEnum(void *handle, const char *key, uint32_t value)
+    {
+        int nRet = MV_CC_SetEnumValue(handle, key, value);
+        if (nRet != MV_OK)
+        {
+            ROS_WARN("MV_CC_SetEnumValue(%s=%u) failed, nRet=0x%x", key, value, nRet);
+        }
+        else
+        {
+            ROS_INFO("Set %s = %u", key, value);
+        }
+        return nRet;
+    }
+
+    [[maybe_unused]] static int TrySetBoolByInt(void *handle, const char *key, bool on)
+    {
+        return TrySetInt(handle, key, on ? 1 : 0);
+    }
+
+    static inline uint64_t DevTsTicks(uint32_t hi, uint32_t lo)
+    {
+        return (static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo);
+    }
+
+    static ros::Time DevTsToRosTime(uint64_t ticks)
+    {
+        long double t = dev_ts_offset_epoch_sec + static_cast<long double>(ticks) / dev_ts_tick_hz;
+        if (t < 0)
+        {
+            t = 0;
+        }
+        const uint32_t sec = static_cast<uint32_t>(std::floor(t));
+        long double frac = (t - static_cast<long double>(sec)) * 1e9L;
+        uint32_t nsec = static_cast<uint32_t>(std::llround(frac));
+        uint32_t sec2 = sec;
+        if (nsec >= 1000000000U)
+        {
+            sec2 += 1;
+            nsec -= 1000000000U;
+        }
+        return ros::Time(sec2, nsec);
+    }
+
+    static void SetPtp1588(void *cam_handle, bool enable)
+    {
+        const char *keys[] = {
+            "GevIEEE1588",
+            "Std::GevIEEE1588",
+            "GevIEEE1588Enable",
+            "Std::GevIEEE1588Enable"};
+
+        for (const char *key : keys)
+        {
+            int r1 = TrySetBool(cam_handle, key, enable);
+            HK_LOG("PTP TrySetBool key=%s ret=0x%x", key, (unsigned)r1);
+            if (r1 == MV_OK)
+            {
+                return;
+            }
+            int r2 = TrySetEnum(cam_handle, key, enable ? 1u : 0u);
+            HK_LOG("PTP TrySetEnum key=%s ret=0x%x", key, (unsigned)r2);
+            if (r2 == MV_OK)
+            {
+                return;
+            }
+        }
+        HK_LOG("PTP enable failed for all known keys. Please confirm node name/type.");
+    }
+
+    static void SetGigeTransportParamsIfNeeded(void *cam_handle,
+                                               const MV_CC_DEVICE_INFO *dev_info,
+                                               int gev_scps_packet_size,
+                                               int gev_scpd,
+                                               int gev_heartbeat_timeout_ms)
+    {
+        if (dev_info == NULL)
+        {
+            return;
+        }
+
+        if (dev_info->nTLayerType != MV_GIGE_DEVICE)
+        {
+            ROS_INFO("Non-GigE device, skip GigE transport params.");
+            return;
+        }
+
+        int packet_size_to_set = gev_scps_packet_size;
+        if (packet_size_to_set <= 0)
+        {
+            int nPacketSize = MV_CC_GetOptimalPacketSize(cam_handle);
+            if (nPacketSize > 0)
+            {
+                packet_size_to_set = nPacketSize;
+                ROS_INFO("Optimal packet size from SDK: %d", packet_size_to_set);
+            }
+            else
+            {
+                packet_size_to_set = 1500;
+                ROS_WARN("GetOptimalPacketSize failed (%d), fallback to %d", nPacketSize, packet_size_to_set);
+            }
+        }
+
+        if (packet_size_to_set > 0)
+        {
+            TrySetInt(cam_handle, "GevSCPSPacketSize", packet_size_to_set);
+            TrySetInt(cam_handle, "Std::GevSCPSPacketSize", packet_size_to_set);
+        }
+
+        if (gev_scpd >= 0)
+        {
+            TrySetInt(cam_handle, "GevSCPD", gev_scpd);
+            TrySetInt(cam_handle, "Std::GevSCPD", gev_scpd);
+        }
+
+        if (gev_heartbeat_timeout_ms > 0)
+        {
+            TrySetInt(cam_handle, "GevHeartbeatTimeout", gev_heartbeat_timeout_ms);
+            TrySetInt(cam_handle, "Std::GevHeartbeatTimeout", gev_heartbeat_timeout_ms);
+        }
+
+        // Optional: TrySetBoolByInt(cam_handle, "GevSCPSDoNotFragment", true);
+    }
+
     class Camera
     {
     public:
@@ -61,6 +253,7 @@ namespace camera
         bool reset();
         //********** 读图10个相机的原始图像 ********************************/
         void ReadImg(cv::Mat &image);
+        void ReadImg(cv::Mat &image, ros::Time &stamp);
 
     private:
         //********** handle ******************************/
@@ -91,6 +284,7 @@ namespace camera
     //^ ********************************** Camera constructor************************************ //
     Camera::Camera(ros::NodeHandle &node)
     {
+        HK_LOG("STEP-0: Camera ctor enter");
         handle = NULL;
 
         //********** 读取待设置的摄像头参数 第三个参数是默认值 yaml文件未给出该值时生效 ********************************/
@@ -110,11 +304,24 @@ namespace camera
         node.param("TriggerMode", TriggerMode, 1);
         node.param("TriggerSource", TriggerSource, 2);
         node.param("LineSelector", LineSelector, 2);
+        bool ptp_enable = true;
+        node.param("ptp_enable", ptp_enable, ptp_enable);
+        node.param("use_device_timestamp", use_device_timestamp, true);
+        node.param("device_ts_offset_calib", device_ts_offset_calib, std::string("first"));
+        int gev_scps_packet_size = 0;
+        int gev_scpd = 0;
+        int gev_heartbeat_timeout_ms = 30000;
+        node.param("gev_scps_packet_size", gev_scps_packet_size, gev_scps_packet_size);
+        node.param("gev_scpd", gev_scpd, gev_scpd);
+        node.param("gev_heartbeat_timeout_ms", gev_heartbeat_timeout_ms, gev_heartbeat_timeout_ms);
 
         //********** 枚举设备 ********************************/
         MV_CC_DEVICE_INFO_LIST stDeviceList;
         memset(&stDeviceList, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
+        HK_LOG("STEP-1: EnumDevices begin");
         nRet = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList);
+        HK_CHK(nRet, "EnumDevices");
+        HK_LOG("STEP-1: deviceNum=%u, pDeviceInfo=%p", stDeviceList.nDeviceNum, (void *)stDeviceList.pDeviceInfo);
         if (MV_OK != nRet)
         {
             printf("MV_CC_EnumDevices fail! nRet [%x]\n", nRet);
@@ -142,24 +349,81 @@ namespace camera
 
         //********** 选择设备并创建句柄 *************************/
 
+        if (stDeviceList.nDeviceNum == 0 || stDeviceList.pDeviceInfo == NULL || stDeviceList.pDeviceInfo[0] == NULL)
+        {
+            HK_LOG("FATAL: no device or null device pointer");
+            exit(-1);
+        }
+
+        HK_LOG("STEP-2: CreateHandle begin, pDeviceInfo0=%p", (void *)stDeviceList.pDeviceInfo[0]);
         nRet = MV_CC_CreateHandle(&handle, stDeviceList.pDeviceInfo[0]);
+        HK_CHK(nRet, "CreateHandle");
 
         if (MV_OK != nRet)
         {
             printf("MV_CC_CreateHandle fail! nRet [%x]\n", nRet);
             exit(-1);
         }
+        HK_LOG("STEP-2: handle=%p", handle);
 
         // 打开设备
         //********** frame **********/
 
+        HK_LOG("STEP-3: OpenDevice begin");
         nRet = MV_CC_OpenDevice(handle);
+        HK_CHK(nRet, "OpenDevice");
 
         if (MV_OK != nRet)
         {
             printf("MV_CC_OpenDevice fail! nRet [%x]\n", nRet);
             exit(-1);
         }
+
+        MV_CC_DEVICE_INFO *device_info = stDeviceList.pDeviceInfo[0];
+        if (device_info->nTLayerType == MV_GIGE_DEVICE)
+        {
+            HK_LOG("STEP-4: SetPtp1588 begin ptp_enable=%d", ptp_enable ? 1 : 0);
+            SetPtp1588(handle, ptp_enable);
+            HK_LOG("STEP-4: SetPtp1588 end");
+        }
+        else
+        {
+            ROS_INFO("Non-GigE device, skip PTP enable.");
+        }
+
+        dev_ts_tick_hz = 0.0L;
+        dev_ts_inited = false;
+        last_dev_ticks_valid = false;
+        frame_stamp_valid = false;
+        if (use_device_timestamp)
+        {
+            HK_LOG("STEP-5: TimestampTickFrequency begin");
+            if (device_ts_offset_calib != "first")
+            {
+                ROS_WARN("device_ts_offset_calib=%s not supported, using 'first'.",
+                         device_ts_offset_calib.c_str());
+            }
+            uint64_t tick_hz_value = 0;
+            if (device_info->nTLayerType == MV_GIGE_DEVICE &&
+                (TryGetInt(handle, "GevTimestampTickFrequency", tick_hz_value) ||
+                 TryGetInt(handle, "Std::GevTimestampTickFrequency", tick_hz_value)))
+            {
+                dev_ts_tick_hz = static_cast<long double>(tick_hz_value);
+            }
+            else
+            {
+                ROS_WARN("Failed to read GevTimestampTickFrequency, falling back to ros::Time::now().");
+            }
+            HK_LOG("STEP-5: dev_ts_tick_hz=%Lf", dev_ts_tick_hz);
+        }
+
+        HK_LOG("STEP-6: SetGigeTransportParams begin");
+        SetGigeTransportParamsIfNeeded(handle,
+                                       device_info,
+                                       gev_scps_packet_size,
+                                       gev_scpd,
+                                       gev_heartbeat_timeout_ms);
+        HK_LOG("STEP-6: SetGigeTransportParams end");
 
         //设置 yaml 文件里面的配置
         this->set(CAP_PROP_FRAMERATE_ENABLE, FrameRateEnable);
@@ -258,7 +522,9 @@ namespace camera
         // 开始取流
         //********** frame **********/
 
+        HK_LOG("STEP-7: StartGrabbing begin");
         nRet = MV_CC_StartGrabbing(handle);
+        HK_CHK(nRet, "StartGrabbing");
 
         if (MV_OK != nRet)
         {
@@ -266,6 +532,7 @@ namespace camera
             exit(-1);
         }
         //初始化互斥量
+        HK_LOG("STEP-8: mutex init");
         nRet = pthread_mutex_init(&mutex, NULL);
         if (nRet != 0)
         {
@@ -274,6 +541,7 @@ namespace camera
         }
         //********** frame **********/
 
+        HK_LOG("STEP-9: pthread_create begin");
         nRet = pthread_create(&nThreadID, NULL, HKWorkThread, handle);
 
         if (nRet != 0)
@@ -281,6 +549,7 @@ namespace camera
             printf("thread create failed.ret = %d\n", nRet);
             exit(-1);
         }
+        HK_LOG("STEP-10: Camera ctor exit");
     }
 
     //^ ********************************** Camera constructor************************************ //
@@ -642,16 +911,24 @@ namespace camera
     //^ ********************************** Camera constructor************************************ //
     void Camera::ReadImg(cv::Mat &image)
     {
+        ros::Time dummy;
+        ReadImg(image, dummy);
+    }
+
+    void Camera::ReadImg(cv::Mat &image, ros::Time &stamp)
+    {
 
         pthread_mutex_lock(&mutex);
         if (frame_empty)
         {
             image = cv::Mat();
+            stamp = ros::Time(0);
         }
         else
         {
             image = camera::frame.clone();
             frame_empty = 1;
+            stamp = frame_stamp_valid ? frame_stamp : ros::Time(0);
         }
         pthread_mutex_unlock(&mutex);
     }
@@ -663,10 +940,16 @@ namespace camera
         int nRet;
         unsigned char *m_pBufForDriver = (unsigned char *)malloc(sizeof(unsigned char) * MAX_IMAGE_DATA_SIZE);
         unsigned char *m_pBufForSaveImage = (unsigned char *)malloc(MAX_IMAGE_DATA_SIZE);
+        if (!m_pBufForDriver || !m_pBufForSaveImage)
+        {
+            HK_LOG("malloc failed");
+            exit(-1);
+        }
         MV_FRAME_OUT_INFO_EX stImageInfo = {0};
         MV_CC_PIXEL_CONVERT_PARAM stConvertParam = {0};
         cv::Mat tmp;
         int image_empty_count = 0; //空图帧数
+        int ok_count = 0;
         while (ros::ok())
         {
             start = static_cast<double>(cv::getTickCount());
@@ -678,22 +961,94 @@ namespace camera
                     ROS_INFO("The Number of Faild Reading Exceed The Set Value!\n");
                     exit(-1);
                 }
+                if (image_empty_count == 1 || image_empty_count % 50 == 0)
+                {
+                    HK_LOG("GetOneFrameTimeout fail ret=0x%x empty_count=%d", (unsigned)nRet, image_empty_count);
+                }
                 continue;
             }
             image_empty_count = 0; //空图帧数
             //转换图像格式为BGR8
 
-            stConvertParam.nWidth = 3072;                               //ch:图像宽 | en:image width
-            stConvertParam.nHeight = 2048;                              //ch:图像高 | en:image height
+            ok_count++;
+            if (ok_count == 1)
+            {
+                HK_LOG("First frame: w=%u h=%u len=%u pixel=0x%x ts_hi=%u ts_lo=%u",
+                       stImageInfo.nWidth,
+                       stImageInfo.nHeight,
+                       stImageInfo.nFrameLen,
+                       (unsigned)stImageInfo.enPixelType,
+                       stImageInfo.nDevTimeStampHigh,
+                       stImageInfo.nDevTimeStampLow);
+            }
+
+            memset(&stConvertParam, 0, sizeof(stConvertParam));
+            stConvertParam.nWidth = stImageInfo.nWidth;                 //ch:图像宽 | en:image width
+            stConvertParam.nHeight = stImageInfo.nHeight;               //ch:图像高 | en:image height
             stConvertParam.pSrcData = m_pBufForDriver;                  //ch:输入数据缓存 | en:input data buffer
-            stConvertParam.nSrcDataLen = MAX_IMAGE_DATA_SIZE;           //ch:输入数据大小 | en:input data size
+            if (stImageInfo.nFrameLen > 0)
+            {
+                stConvertParam.nSrcDataLen = stImageInfo.nFrameLen;     //ch:输入数据大小 | en:input data size
+            }
+            else
+            {
+                stConvertParam.nSrcDataLen = MAX_IMAGE_DATA_SIZE;       //ch:输入数据大小 | en:input data size
+            }
             stConvertParam.enDstPixelType = PixelType_Gvsp_BGR8_Packed; //ch:输出像素格式 | en:output pixel format                      //! 输出格式 RGB
             stConvertParam.pDstBuffer = m_pBufForSaveImage;             //ch:输出数据缓存 | en:output data buffer
-            stConvertParam.nDstBufferSize = MAX_IMAGE_DATA_SIZE;        //ch:输出缓存大小 | en:output buffer size
+            uint64_t dst_size = static_cast<uint64_t>(stImageInfo.nWidth) *
+                                static_cast<uint64_t>(stImageInfo.nHeight) * 3;
+            if (dst_size > MAX_IMAGE_DATA_SIZE)
+            {
+                dst_size = MAX_IMAGE_DATA_SIZE;
+            }
+            stConvertParam.nDstBufferSize = static_cast<unsigned int>(dst_size); //ch:输出缓存大小 | en:output buffer size
             stConvertParam.enSrcPixelType = stImageInfo.enPixelType;    //ch:输入像素格式 | en:input pixel format                       //! 输入格式 RGB
-            MV_CC_ConvertPixelType(p_handle, &stConvertParam);
+            int cvtRet = MV_CC_ConvertPixelType(p_handle, &stConvertParam);
+            if (cvtRet != MV_OK)
+            {
+                HK_LOG("Convert failed ret=0x%x srcLen=%u dstBuf=%u srcPixel=0x%x",
+                       (unsigned)cvtRet,
+                       stConvertParam.nSrcDataLen,
+                       stConvertParam.nDstBufferSize,
+                       (unsigned)stConvertParam.enSrcPixelType);
+                ROS_WARN("MV_CC_ConvertPixelType failed, nRet=0x%x", cvtRet);
+                continue;
+            }
             pthread_mutex_lock(&mutex);
             camera::frame = cv::Mat(stImageInfo.nHeight, stImageInfo.nWidth, CV_8UC3, m_pBufForSaveImage).clone(); //tmp.clone();
+            if (use_device_timestamp && dev_ts_tick_hz > 0.0L)
+            {
+                uint64_t ticks = DevTsTicks(stImageInfo.nDevTimeStampHigh, stImageInfo.nDevTimeStampLow);
+                if (ticks == 0 || (last_dev_ticks_valid && ticks == last_dev_ticks))
+                {
+                    frame_stamp = ros::Time::now();
+                    frame_stamp_valid = true;
+                }
+                else if (!dev_ts_inited || !last_dev_ticks_valid || ticks <= last_dev_ticks)
+                {
+                    ros::Time now = ros::Time::now();
+                    dev_ts_offset_epoch_sec = static_cast<long double>(now.toSec()) -
+                                              static_cast<long double>(ticks) / dev_ts_tick_hz;
+                    dev_ts_inited = true;
+                    last_dev_ticks = ticks;
+                    last_dev_ticks_valid = true;
+                    frame_stamp = DevTsToRosTime(ticks);
+                    frame_stamp_valid = true;
+                }
+                else
+                {
+                    frame_stamp = DevTsToRosTime(ticks);
+                    frame_stamp_valid = true;
+                    last_dev_ticks = ticks;
+                    last_dev_ticks_valid = true;
+                }
+            }
+            else
+            {
+                frame_stamp = ros::Time::now();
+                frame_stamp_valid = true;
+            }
             frame_empty = 0;
             pthread_mutex_unlock(&mutex);
             double time = ((double)cv::getTickCount() - start) / cv::getTickFrequency();
