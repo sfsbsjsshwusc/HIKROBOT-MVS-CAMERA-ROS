@@ -13,6 +13,19 @@
 
 namespace camera
 {
+#define HK_LOG(fmt, ...)                                      \
+    do                                                        \
+    {                                                         \
+        fprintf(stderr, "[HK] " fmt "\n", ##__VA_ARGS__);      \
+        fflush(stderr);                                       \
+    } while (0)
+
+#define HK_CHK(ret, msg)                                      \
+    do                                                        \
+    {                                                         \
+        HK_LOG("%s ret=0x%x", msg, (unsigned)(ret));          \
+    } while (0)
+
 //********** define ************************************/
 #define MAX_IMAGE_DATA_SIZE (4 * 2048 * 3072)
     //********** frame ************************************/
@@ -152,16 +165,20 @@ namespace camera
 
         for (const char *key : keys)
         {
-            if (TrySetBool(cam_handle, key, enable) == MV_OK)
+            int r1 = TrySetBool(cam_handle, key, enable);
+            HK_LOG("PTP TrySetBool key=%s ret=0x%x", key, (unsigned)r1);
+            if (r1 == MV_OK)
             {
                 return;
             }
-            if (TrySetEnum(cam_handle, key, enable ? 1u : 0u) == MV_OK)
+            int r2 = TrySetEnum(cam_handle, key, enable ? 1u : 0u);
+            HK_LOG("PTP TrySetEnum key=%s ret=0x%x", key, (unsigned)r2);
+            if (r2 == MV_OK)
             {
                 return;
             }
         }
-        ROS_WARN("PTP enable failed for all known keys. Please confirm node name/type.");
+        HK_LOG("PTP enable failed for all known keys. Please confirm node name/type.");
     }
 
     static void SetGigeTransportParamsIfNeeded(void *cam_handle,
@@ -267,6 +284,7 @@ namespace camera
     //^ ********************************** Camera constructor************************************ //
     Camera::Camera(ros::NodeHandle &node)
     {
+        HK_LOG("STEP-0: Camera ctor enter");
         handle = NULL;
 
         //********** 读取待设置的摄像头参数 第三个参数是默认值 yaml文件未给出该值时生效 ********************************/
@@ -300,7 +318,10 @@ namespace camera
         //********** 枚举设备 ********************************/
         MV_CC_DEVICE_INFO_LIST stDeviceList;
         memset(&stDeviceList, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
+        HK_LOG("STEP-1: EnumDevices begin");
         nRet = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList);
+        HK_CHK(nRet, "EnumDevices");
+        HK_LOG("STEP-1: deviceNum=%u, pDeviceInfo=%p", stDeviceList.nDeviceNum, (void *)stDeviceList.pDeviceInfo);
         if (MV_OK != nRet)
         {
             printf("MV_CC_EnumDevices fail! nRet [%x]\n", nRet);
@@ -328,18 +349,29 @@ namespace camera
 
         //********** 选择设备并创建句柄 *************************/
 
+        if (stDeviceList.nDeviceNum == 0 || stDeviceList.pDeviceInfo == NULL || stDeviceList.pDeviceInfo[0] == NULL)
+        {
+            HK_LOG("FATAL: no device or null device pointer");
+            exit(-1);
+        }
+
+        HK_LOG("STEP-2: CreateHandle begin, pDeviceInfo0=%p", (void *)stDeviceList.pDeviceInfo[0]);
         nRet = MV_CC_CreateHandle(&handle, stDeviceList.pDeviceInfo[0]);
+        HK_CHK(nRet, "CreateHandle");
 
         if (MV_OK != nRet)
         {
             printf("MV_CC_CreateHandle fail! nRet [%x]\n", nRet);
             exit(-1);
         }
+        HK_LOG("STEP-2: handle=%p", handle);
 
         // 打开设备
         //********** frame **********/
 
+        HK_LOG("STEP-3: OpenDevice begin");
         nRet = MV_CC_OpenDevice(handle);
+        HK_CHK(nRet, "OpenDevice");
 
         if (MV_OK != nRet)
         {
@@ -350,7 +382,9 @@ namespace camera
         MV_CC_DEVICE_INFO *device_info = stDeviceList.pDeviceInfo[0];
         if (device_info->nTLayerType == MV_GIGE_DEVICE)
         {
+            HK_LOG("STEP-4: SetPtp1588 begin ptp_enable=%d", ptp_enable ? 1 : 0);
             SetPtp1588(handle, ptp_enable);
+            HK_LOG("STEP-4: SetPtp1588 end");
         }
         else
         {
@@ -363,6 +397,7 @@ namespace camera
         frame_stamp_valid = false;
         if (use_device_timestamp)
         {
+            HK_LOG("STEP-5: TimestampTickFrequency begin");
             if (device_ts_offset_calib != "first")
             {
                 ROS_WARN("device_ts_offset_calib=%s not supported, using 'first'.",
@@ -379,13 +414,16 @@ namespace camera
             {
                 ROS_WARN("Failed to read GevTimestampTickFrequency, falling back to ros::Time::now().");
             }
+            HK_LOG("STEP-5: dev_ts_tick_hz=%Lf", dev_ts_tick_hz);
         }
 
+        HK_LOG("STEP-6: SetGigeTransportParams begin");
         SetGigeTransportParamsIfNeeded(handle,
                                        device_info,
                                        gev_scps_packet_size,
                                        gev_scpd,
                                        gev_heartbeat_timeout_ms);
+        HK_LOG("STEP-6: SetGigeTransportParams end");
 
         //设置 yaml 文件里面的配置
         this->set(CAP_PROP_FRAMERATE_ENABLE, FrameRateEnable);
@@ -484,7 +522,9 @@ namespace camera
         // 开始取流
         //********** frame **********/
 
+        HK_LOG("STEP-7: StartGrabbing begin");
         nRet = MV_CC_StartGrabbing(handle);
+        HK_CHK(nRet, "StartGrabbing");
 
         if (MV_OK != nRet)
         {
@@ -492,6 +532,7 @@ namespace camera
             exit(-1);
         }
         //初始化互斥量
+        HK_LOG("STEP-8: mutex init");
         nRet = pthread_mutex_init(&mutex, NULL);
         if (nRet != 0)
         {
@@ -500,6 +541,7 @@ namespace camera
         }
         //********** frame **********/
 
+        HK_LOG("STEP-9: pthread_create begin");
         nRet = pthread_create(&nThreadID, NULL, HKWorkThread, handle);
 
         if (nRet != 0)
@@ -507,6 +549,7 @@ namespace camera
             printf("thread create failed.ret = %d\n", nRet);
             exit(-1);
         }
+        HK_LOG("STEP-10: Camera ctor exit");
     }
 
     //^ ********************************** Camera constructor************************************ //
@@ -897,10 +940,16 @@ namespace camera
         int nRet;
         unsigned char *m_pBufForDriver = (unsigned char *)malloc(sizeof(unsigned char) * MAX_IMAGE_DATA_SIZE);
         unsigned char *m_pBufForSaveImage = (unsigned char *)malloc(MAX_IMAGE_DATA_SIZE);
+        if (!m_pBufForDriver || !m_pBufForSaveImage)
+        {
+            HK_LOG("malloc failed");
+            exit(-1);
+        }
         MV_FRAME_OUT_INFO_EX stImageInfo = {0};
         MV_CC_PIXEL_CONVERT_PARAM stConvertParam = {0};
         cv::Mat tmp;
         int image_empty_count = 0; //空图帧数
+        int ok_count = 0;
         while (ros::ok())
         {
             start = static_cast<double>(cv::getTickCount());
@@ -912,11 +961,28 @@ namespace camera
                     ROS_INFO("The Number of Faild Reading Exceed The Set Value!\n");
                     exit(-1);
                 }
+                if (image_empty_count == 1 || image_empty_count % 50 == 0)
+                {
+                    HK_LOG("GetOneFrameTimeout fail ret=0x%x empty_count=%d", (unsigned)nRet, image_empty_count);
+                }
                 continue;
             }
             image_empty_count = 0; //空图帧数
             //转换图像格式为BGR8
 
+            ok_count++;
+            if (ok_count == 1)
+            {
+                HK_LOG("First frame: w=%u h=%u len=%u pixel=0x%x ts_hi=%u ts_lo=%u",
+                       stImageInfo.nWidth,
+                       stImageInfo.nHeight,
+                       stImageInfo.nFrameLen,
+                       (unsigned)stImageInfo.enPixelType,
+                       stImageInfo.nDevTimeStampHigh,
+                       stImageInfo.nDevTimeStampLow);
+            }
+
+            memset(&stConvertParam, 0, sizeof(stConvertParam));
             stConvertParam.nWidth = stImageInfo.nWidth;                 //ch:图像宽 | en:image width
             stConvertParam.nHeight = stImageInfo.nHeight;               //ch:图像高 | en:image height
             stConvertParam.pSrcData = m_pBufForDriver;                  //ch:输入数据缓存 | en:input data buffer
@@ -941,6 +1007,11 @@ namespace camera
             int cvtRet = MV_CC_ConvertPixelType(p_handle, &stConvertParam);
             if (cvtRet != MV_OK)
             {
+                HK_LOG("Convert failed ret=0x%x srcLen=%u dstBuf=%u srcPixel=0x%x",
+                       (unsigned)cvtRet,
+                       stConvertParam.nSrcDataLen,
+                       stConvertParam.nDstBufferSize,
+                       (unsigned)stConvertParam.enSrcPixelType);
                 ROS_WARN("MV_CC_ConvertPixelType failed, nRet=0x%x", cvtRet);
                 continue;
             }
